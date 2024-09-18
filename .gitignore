@@ -20,6 +20,8 @@ go.work
 testdata/
 bin/
 
+/cover.out
+
 ### VSCode
 
 .vscode/

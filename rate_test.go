@@ -13,8 +13,6 @@ import (
 	"github.com/testcontainers/testcontainers-go/modules/redis"
 )
 
-const infTTL = 1 * time.Hour // inf TTL for our test purposes.
-
 var (
 	redisAddr string
 	now       = time.Now()
@@ -40,28 +38,27 @@ type allow struct {
 }
 
 func setupRedis() (teardown func(ctx context.Context) error, err error) {
-	ctx := context.Background()
-	reds, err := redis.Run(ctx, "redis:latest")
+	reds, err := redis.Run(context.Background(), "redis:latest")
 	if err != nil {
 		return nil, err
 	}
-	addr, err := reds.Endpoint(ctx, "")
+	addr, err := reds.Endpoint(context.Background(), "")
 	if err != nil {
 		return nil, err
 	}
 	redisAddr = addr
-	log.Println(redisAddr)
 	return reds.Terminate, nil
 }
 
 func initLimiter(t *testing.T, rds rediser, key string, limit Limit) *Limiter {
 	t.Helper()
-	l := NewLimiter(rds, key, limit)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
-	defer cancel()
-	if err := l.Reset(ctx); err != nil {
-		t.Fatalf("Failed to reset limiter: %v", err)
+	l, err := NewLimiter(rds, key, limit)
+	if err != nil {
+		t.Fatalf("Failed to create a limiter: %v", err)
+	}
+	if err := l.Reset(context.Background()); err != nil {
+		t.Fatalf("Failed to reset a limiter: %v", err)
 	}
 	return l
 }
@@ -70,10 +67,7 @@ func testAllow(t *testing.T, l *Limiter, allows ...allow) {
 	t.Helper()
 
 	for i, allow := range allows {
-		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
-		status, err := l.allowAt(ctx, allow.now, 2*l.lim.Interval)
-		cancel()
-
+		status, err := l.allowAt(context.Background(), allow.now, 2*l.lim.Interval)
 		if err != nil {
 			t.Fatalf("Step %d: Allow() unexpected error: %v", i, err)
 		}
@@ -89,12 +83,12 @@ func TestMain(m *testing.M) {
 func testMain(m *testing.M) (code int) {
 	teardown, err := setupRedis()
 	if err != nil {
-		log.Fatalf("Failed to setup Redis: %v", err)
+		log.Printf("Failed to setup Redis: %v\n", err)
 		return 1
 	}
 	defer func() {
 		if err := teardown(context.Background()); err != nil {
-			log.Fatalf("Failed to setup Redis: %v", err)
+			log.Printf("Failed to setup Redis: %v\n", err)
 			code = 1
 		}
 	}()
@@ -113,10 +107,14 @@ func TestAllow(t *testing.T) {
 
 		testAllow(t, l, allow)
 
-		l.SetLimit(Limit{0, 3 * time.Second})
+		if err := l.SetLimit(context.Background(), Limit{0, 3 * time.Second}); err != nil {
+			t.Fatalf("SetLimit() unexpected error: %v", err)
+		}
 		testAllow(t, l, allow)
 
-		l.SetLimit(Limit{0, 10 * time.Second})
+		if err := l.SetLimit(context.Background(), Limit{0, 10 * time.Second}); err != nil {
+			t.Fatalf("SetLimit() unexpected error: %v", err)
+		}
 		testAllow(t, l, allow)
 	})
 
@@ -166,6 +164,19 @@ func TestAllow(t *testing.T) {
 		)
 	})
 
+	t.Run("window larger now", func(t *testing.T) {
+		t.Parallel()
+
+		limi := time.Duration(now.Add(1*time.Hour).UnixMilli()) * time.Millisecond // interval larger than now
+		l := initLimiter(t, rds, fmt.Sprintf("%s:%s", key, t.Name()), Limit{2, limi})
+
+		testAllow(t, l,
+			allow{now, Status{false, 1, 0}},
+			allow{now.Add(1 * time.Second), Status{false, 0, limi - 1*time.Second}},
+			allow{now.Add(10 * time.Second), Status{true, 0, limi - 10*time.Second}},
+		)
+	})
+
 	t.Run("sub-second", func(t *testing.T) {
 		t.Parallel()
 
@@ -177,29 +188,6 @@ func TestAllow(t *testing.T) {
 			allow{now.Add(2 * time.Millisecond), Status{false, 0, 2 * time.Millisecond}},
 		)
 	})
-
-	t.Run("sub-millisecond", func(t *testing.T) {
-		t.Parallel()
-
-		l := initLimiter(t, rds, fmt.Sprintf("%s:%s", key, t.Name()), Limit{1, 500 * time.Nanosecond})
-
-		testAllow(t, l,
-			allow{now, Status{false, 0, 0 * time.Second}},
-			allow{now.Add(1 * time.Millisecond), Status{false, 0, 0 * time.Second}},
-		)
-
-		l.SetLimit(Limit{3, 500 * time.Nanosecond})
-		testAllow(t, l,
-			allow{now, Status{false, 2, 0 * time.Second}},
-			allow{now.Add(1 * time.Millisecond), Status{false, 2, 0 * time.Second}},
-		)
-
-		l.SetLimit(Limit{3, 500 * time.Nanosecond})
-		testAllow(t, l,
-			allow{now.Add(2 * time.Second), Status{false, 2, 0 * time.Second}},
-			allow{now.Add(3 * time.Second), Status{false, 2, 0 * time.Second}},
-		)
-	})
 }
 
 func TestSetLimit(t *testing.T) {
@@ -209,17 +197,18 @@ func TestSetLimit(t *testing.T) {
 	t.Run("incr events", func(t *testing.T) {
 		t.Parallel()
 
-		l := initLimiter(t, rds, fmt.Sprintf("%s:%s", key, t.Name()), Limit{})
-
 		lim := Limit{1, 10 * time.Second}
-		l.SetLimit(lim)
+
+		l := initLimiter(t, rds, fmt.Sprintf("%s:%s", key, t.Name()), lim)
 		testAllow(t, l,
 			allow{now, Status{false, 0, 10 * time.Second}},
 			allow{now.Add(1 * time.Second), Status{true, 0, 9 * time.Second}},
 		)
 
 		lim.Events = 5
-		l.SetLimit(lim)
+		if err := l.SetLimit(context.Background(), lim); err != nil {
+			t.Fatalf("SetLimit() unexpected error: %v", err)
+		}
 		testAllow(t, l,
 			allow{now.Add(2 * time.Second), Status{false, 3, 0 * time.Second}},
 			allow{now.Add(3 * time.Second), Status{false, 2, 0 * time.Second}},
@@ -229,16 +218,15 @@ func TestSetLimit(t *testing.T) {
 	t.Run("incr interval", func(t *testing.T) {
 		t.Parallel()
 
-		l := initLimiter(t, rds, fmt.Sprintf("%s:%s", key, t.Name()), Limit{})
-
 		lim := Limit{1, 10 * time.Second}
-
-		l.SetLimit(lim)
+		l := initLimiter(t, rds, fmt.Sprintf("%s:%s", key, t.Name()), lim)
 		testAllow(t, l, allow{now, Status{false, 0, 10 * time.Second}})
 		testAllow(t, l, allow{now.Add(1 * time.Second), Status{true, 0, 9 * time.Second}})
 
 		lim.Interval = 20 * time.Second
-		l.SetLimit(lim)
+		if err := l.SetLimit(context.Background(), lim); err != nil {
+			t.Fatalf("SetLimit() unexpected error: %v", err)
+		}
 		testAllow(t, l, allow{now.Add(2 * time.Second), Status{true, 0, 18 * time.Second}})
 		testAllow(t, l, allow{now.Add(3 * time.Second), Status{true, 0, 17 * time.Second}})
 	})
@@ -246,10 +234,9 @@ func TestSetLimit(t *testing.T) {
 	t.Run("decr events", func(t *testing.T) {
 		t.Parallel()
 
-		l := initLimiter(t, rds, fmt.Sprintf("%s:%s", key, t.Name()), Limit{})
-
 		lim := Limit{10, 10 * time.Second}
-		l.SetLimit(lim)
+
+		l := initLimiter(t, rds, fmt.Sprintf("%s:%s", key, t.Name()), lim)
 		testAllow(t, l, allow{now, Status{false, 9, 0 * time.Second}})
 		testAllow(t, l, allow{now.Add(1 * time.Second), Status{false, 8, 0 * time.Second}})
 		testAllow(t, l, allow{now.Add(2 * time.Second), Status{false, 7, 0 * time.Second}})
@@ -257,7 +244,9 @@ func TestSetLimit(t *testing.T) {
 		testAllow(t, l, allow{now.Add(4 * time.Second), Status{false, 5, 0 * time.Second}})
 
 		lim.Events = 2
-		l.SetLimit(lim)
+		if err := l.SetLimit(context.Background(), lim); err != nil {
+			t.Fatalf("SetLimit() unexpected error: %v", err)
+		}
 		testAllow(t, l, allow{now.Add(5 * time.Second), Status{true, 0, 8 * time.Second}})
 		testAllow(t, l, allow{now.Add(6 * time.Second), Status{true, 0, 7 * time.Second}})
 		testAllow(t, l, allow{now.Add(7 * time.Second), Status{true, 0, 6 * time.Second}})
@@ -266,15 +255,16 @@ func TestSetLimit(t *testing.T) {
 	t.Run("decr interval", func(t *testing.T) {
 		t.Parallel()
 
-		l := initLimiter(t, rds, fmt.Sprintf("%s:%s", key, t.Name()), Limit{})
-
 		lim := Limit{4, 20 * time.Second}
-		l.SetLimit(lim)
+
+		l := initLimiter(t, rds, fmt.Sprintf("%s:%s", key, t.Name()), lim)
 		testAllow(t, l, allow{now, Status{false, 3, 0 * time.Second}})
 		testAllow(t, l, allow{now.Add(1 * time.Second), Status{false, 2, 0 * time.Second}})
 
 		lim.Interval = 10 * time.Second
-		l.SetLimit(lim)
+		if err := l.SetLimit(context.Background(), lim); err != nil {
+			t.Fatalf("SetLimit() unexpected error: %v", err)
+		}
 		testAllow(t, l, allow{now.Add(2 * time.Second), Status{false, 1, 0 * time.Second}})
 		testAllow(t, l, allow{now.Add(3 * time.Second), Status{false, 0, 7 * time.Second}})
 		testAllow(t, l, allow{now.Add(4 * time.Second), Status{true, 0, 6 * time.Second}})
@@ -283,21 +273,41 @@ func TestSetLimit(t *testing.T) {
 }
 
 func TestInvalidInterval(t *testing.T) {
-	rds := rediser{rds.NewClient(&rds.Options{Addr: redisAddr})}
-	l := initLimiter(t, rds, "ratelimit:test_invalid_interval", Limit{1, 0})
-
-	testAllowErr := func() {
-		t.Helper()
-		if _, err := l.allowAt(context.Background(), now, infTTL); !errors.Is(err, errInvalidInterval) {
-			t.Errorf("Allow() returned error: %v, want %v", err, errInvalidInterval)
-		}
+	tests := []Limit{
+		{1, -1},
+		{1, 0},
+		{1, 500 * time.Nanosecond},
 	}
 
-	testAllowErr()
+	for _, tt := range tests {
+		if _, err := NewLimiter(nil, "", tt); !errors.Is(err, errInvalidInterval) {
+			t.Fatalf("NewSlidingLog() unexpected error: %v", err)
+		}
+	}
+}
 
-	l.SetLimit(Limit{Interval: 0})
-	testAllowErr()
+func TestReset(t *testing.T) {
+	t.Parallel()
 
-	l.SetLimit(Limit{Interval: -1})
-	testAllowErr()
+	rds := rediser{rds.NewClient(&rds.Options{Addr: redisAddr})}
+	key := "ratelimit:test_reset"
+
+	l := initLimiter(t, rds, fmt.Sprintf("%s:%s", key, t.Name()), Limit{4, 20 * time.Second})
+	testAllow(t, l,
+		allow{now, Status{false, 3, 0 * time.Second}},
+		allow{now.Add(1 * time.Second), Status{false, 2, 0 * time.Second}},
+		allow{now.Add(2 * time.Second), Status{false, 1, 0 * time.Second}},
+		allow{now.Add(3 * time.Second), Status{false, 0, 17 * time.Second}},
+		allow{now.Add(4 * time.Second), Status{true, 0, 16 * time.Second}},
+	)
+	if err := l.Reset(context.Background()); err != nil {
+		t.Fatalf("Reset() returned an error: %v", err)
+	}
+	testAllow(t, l,
+		allow{now, Status{false, 3, 0 * time.Second}},
+		allow{now.Add(1 * time.Second), Status{false, 2, 0 * time.Second}},
+		allow{now.Add(2 * time.Second), Status{false, 1, 0 * time.Second}},
+		allow{now.Add(3 * time.Second), Status{false, 0, 17 * time.Second}},
+		allow{now.Add(4 * time.Second), Status{true, 0, 16 * time.Second}},
+	)
 }

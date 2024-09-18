@@ -4,11 +4,4 @@
 [![Go Report Card](https://goreportcard.com/badge/github.com/denpeshkov/throttle)](https://goreportcard.com/report/github.com/denpeshkov/throttle)
 [![Go Reference](https://pkg.go.dev/badge/github.com/denpeshkov/throttle.svg)](https://pkg.go.dev/github.com/denpeshkov/throttle)
 
-A Go library that implements a rate limiter using various algorithms, backed by [Redis](https://redis.io).
-
-Currently implemented rate-limiting algorithms:
-- Sliding Window Log
-- Sliding Window Counter
-- Token Bucket
-
-For an overview of the pros and cons of different rate-limiting algorithms, check out this reference: [How to Design a Scalable Rate Limiting Algorithm with Kong API](https://konghq.com/blog/engineering/how-to-design-a-scalable-rate-limiting-algorithm)
+A Go library that implements a rate limiter backed by [Redis](https://redis.io).

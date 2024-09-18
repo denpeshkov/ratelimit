@@ -13,7 +13,7 @@ import (
 // Inf is the infinite duration.
 const Inf = time.Duration(math.MaxInt64)
 
-var errInvalidInterval = errors.New("limit interval is not positive")
+var errInvalidInterval = errors.New("limit interval below 1 ms")
 
 // Rediser defines an interface to abstract a Redis client.
 type Rediser interface {
@@ -26,7 +26,7 @@ type Rediser interface {
 }
 
 // Limit defines the maximum number of events allowed within a specified time interval.
-// Setting Events to zero disallows all events. Interval must be a positive duration.
+// Setting Events to zero disallows all events. Interval must be at least 1 millisecond.
 type Limit struct {
 	Events   int
 	Interval time.Duration
@@ -36,7 +36,7 @@ func (l Limit) String() string {
 	return fmt.Sprintf("%d req in %s", l.Events, l.Interval.String())
 }
 
-// Status represents the current status of the limit.
+// Status represents the result of evaluating the rate limit.
 type Status struct {
 	// Limited indicates whether the current event was limited.
 	Limited bool
@@ -64,9 +64,6 @@ func (s Status) String() string {
 var luaScript string
 
 // A Limiter controls how frequently events are allowed to happen.
-// It implements a "sliding window" algorithm backed by [Redis].
-//
-// [Redis]: https://redis.io
 type Limiter struct {
 	rds        Rediser
 	scriptSHA1 string
@@ -74,21 +71,24 @@ type Limiter struct {
 	lim        Limit
 }
 
-// NewLimiter returns a new Limiter for the given key that allows events up to the specified limit.
-// Creating multiple Limiter instances for the same key with different limits may violate limits.
-func NewLimiter(rds Rediser, key string, limit Limit) *Limiter {
-	return &Limiter{rds: rds, scriptSHA1: "", key: key, lim: limit}
+// NewLimiter returns a new [Limiter] for the given key that allows events up to the specified limit.
+// Creating multiple [Limiter] instances for the same key with different limits may violate limits.
+// It implements a "sliding window log" algorithm backed by [Redis].
+//
+// [Redis]: https://redis.io
+func NewLimiter(rds Rediser, key string, limit Limit) (*Limiter, error) {
+	if limit.Interval.Milliseconds() <= 0 {
+		return nil, errInvalidInterval
+	}
+	return &Limiter{rds: rds, scriptSHA1: "", key: key, lim: limit}, nil
 }
 
-// Allow returns the status of the current request.
+// Allow returns the result of evaluating whether the event can occur now.
 func (l *Limiter) Allow(ctx context.Context) (*Status, error) {
 	return l.allowAt(ctx, time.Now(), 2*l.lim.Interval)
 }
 
 func (l *Limiter) allowAt(ctx context.Context, now time.Time, keyTTL time.Duration) (*Status, error) {
-	if l.lim.Interval <= 0 {
-		return nil, errInvalidInterval
-	}
 	if l.lim.Events == 0 {
 		return &Status{Limited: true, Remaining: 0, Delay: Inf}, nil
 	}
@@ -96,7 +96,7 @@ func (l *Limiter) allowAt(ctx context.Context, now time.Time, keyTTL time.Durati
 	keys := []string{l.key}
 	args := []any{l.lim.Events, l.lim.Interval.Milliseconds(), now.UnixMilli(), keyTTL.Milliseconds()}
 
-	v, err := l.execScript(ctx, keys, args)
+	v, err := l.execScript(ctx, keys, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -128,14 +128,18 @@ func (l *Limiter) Limit() Limit {
 	return l.lim
 }
 
-// SetLimit sets a new Limit for the limiter.
+// SetLimit sets a new [Limit] for the limiter.
 // If the new limit's Interval exceeds the current one, the new limit may be
 // temporarily violated by up to the difference between the new and current limit's Interval durations.
-func (l *Limiter) SetLimit(newLimit Limit) {
+func (l *Limiter) SetLimit(_ context.Context, newLimit Limit) error {
+	if newLimit.Interval.Milliseconds() <= 0 {
+		return errInvalidInterval
+	}
 	l.lim = newLimit
+	return nil
 }
 
-// Reset clears all limitations and previous usages of the limiter.
+// Reset clears all limitations and previous usage of the limiter.
 func (l *Limiter) Reset(ctx context.Context) error {
 	_, err := l.rds.Del(ctx, l.key)
 	return err
