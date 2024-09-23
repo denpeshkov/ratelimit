@@ -10,6 +10,7 @@ import (
 	"time"
 
 	rds "github.com/redis/go-redis/v9"
+	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/modules/redis"
 )
 
@@ -34,11 +35,15 @@ func (r rediser) Del(ctx context.Context, keys ...string) (int64, error) {
 
 type allow struct {
 	now    time.Time
-	status Status
+	status *Status
 }
 
+type noopLogger struct{}
+
+func (noopLogger) Printf(format string, v ...interface{}) {}
+
 func setupRedis() (teardown func(ctx context.Context) error, err error) {
-	reds, err := redis.Run(context.Background(), "redis:latest")
+	reds, err := redis.Run(context.Background(), "redis:latest", testcontainers.WithLogger(noopLogger{}))
 	if err != nil {
 		return nil, err
 	}
@@ -66,13 +71,13 @@ func initLimiter(t *testing.T, rds rediser, key string, limit Limit) *Limiter {
 func testAllow(t *testing.T, l *Limiter, allows ...allow) {
 	t.Helper()
 
-	for i, allow := range allows {
-		status, err := l.allowAt(context.Background(), allow.now, 2*l.lim.Interval)
+	for _, a := range allows {
+		status, err := l.allowAt(context.Background(), a.now, Inf)
 		if err != nil {
-			t.Fatalf("Step %d: Allow() unexpected error: %v", i, err)
+			t.Errorf("allowAt(%s) unexpected error: %v", a.now.Format("15:04:05.000"), err)
 		}
-		if *status != allow.status {
-			t.Errorf("Step %d: Allow() = %s, want %s", i, status, allow.status)
+		if *status != *a.status {
+			t.Errorf("allowAt(%s) = %s, want %s", a.now.Format("15:04:05.000"), status, a.status)
 		}
 	}
 }
@@ -88,12 +93,14 @@ func testMain(m *testing.M) (code int) {
 	}
 	defer func() {
 		if err := teardown(context.Background()); err != nil {
-			log.Printf("Failed to setup Redis: %v\n", err)
+			log.Printf("Failed to teardown Redis: %v\n", err)
 			code = 1
 		}
 	}()
 	return m.Run()
 }
+
+const delta = 1 * time.Millisecond // Limiter resolution.s
 
 func TestAllow(t *testing.T) {
 	rds := rediser{rds.NewClient(&rds.Options{Addr: redisAddr})}
@@ -102,91 +109,114 @@ func TestAllow(t *testing.T) {
 	t.Run("disallow all", func(t *testing.T) {
 		t.Parallel()
 
-		l := initLimiter(t, rds, fmt.Sprintf("%s:%s", key, t.Name()), Limit{0, 1 * time.Second})
-		allow := allow{now, Status{true, 0, Inf}}
+		allow := allow{now, &Status{true, 0, Inf}}
 
-		testAllow(t, l, allow)
-
-		if err := l.SetLimit(context.Background(), Limit{0, 3 * time.Second}); err != nil {
-			t.Fatalf("SetLimit() unexpected error: %v", err)
-		}
-		testAllow(t, l, allow)
-
-		if err := l.SetLimit(context.Background(), Limit{0, 10 * time.Second}); err != nil {
-			t.Fatalf("SetLimit() unexpected error: %v", err)
-		}
+		l := initLimiter(t, rds, fmt.Sprintf("%s:%s", key, t.Name()), Limit{Events: 0, Interval: 1 * time.Second})
 		testAllow(t, l, allow)
 	})
 
 	t.Run("basic", func(t *testing.T) {
 		t.Parallel()
 
-		l := initLimiter(t, rds, fmt.Sprintf("%s:%s", key, t.Name()), Limit{3, 5 * time.Second})
+		lims := []Limit{
+			{Events: 1, Interval: 10 * time.Millisecond},
+			{Events: 2, Interval: 10 * time.Millisecond},
+			{Events: 10, Interval: 10 * time.Millisecond},
+			{Events: 1, Interval: 999 * time.Millisecond},
+			{Events: 2, Interval: 999 * time.Millisecond},
+			{Events: 10, Interval: 999 * time.Millisecond},
+			{Events: 1, Interval: 1 * time.Second},
+			{Events: 2, Interval: 1 * time.Second},
+			{Events: 10, Interval: 1 * time.Second},
+		}
 
-		testAllow(t, l,
-			allow{now, Status{false, 2, 0 * time.Second}},
-			allow{now.Add(1 * time.Second), Status{false, 1, 0 * time.Second}},
-			allow{now.Add(2 * time.Second), Status{false, 0, 3 * time.Second}},
-			allow{now.Add(3 * time.Second), Status{true, 0, 2 * time.Second}},
-			allow{now.Add(4 * time.Second), Status{true, 0, 1 * time.Second}},
-			allow{now.Add(5 * time.Second), Status{false, 0, 1 * time.Second}},
-			allow{now.Add(6 * time.Second), Status{false, 0, 1 * time.Second}},
-			allow{now.Add(7 * time.Second), Status{false, 0, 3 * time.Second}},
-			allow{now.Add(8 * time.Second), Status{true, 0, 2 * time.Second}},
-		)
+		for _, lim := range lims {
+			t.Run(lim.String(), func(t *testing.T) {
+				t.Parallel()
+
+				now := now
+				t.Logf("now: %s", now.Format("15:04:05.000"))
+
+				l := initLimiter(t, rds, fmt.Sprintf("%s:%s", key, t.Name()), lim)
+
+				// Hit until last unlimited event.
+				want := Status{Limited: false, Remaining: lim.Events - 1, Delay: 0}
+				for want.Remaining > 0 {
+					s, err := l.allowAt(context.Background(), now, Inf)
+					if err != nil {
+						t.Fatalf("allowAt(%s) error: %v", now.Format("15:04:05.000"), err)
+					}
+					if *s != want {
+						t.Errorf("allowAt(%s) = %s, want %s", now.Format("15:04:05.000"), s, want)
+					}
+					want.Remaining--
+					now = now.Add(delta)
+				}
+
+				// Last unlimited event should have some positive delay.
+				s, err := l.allowAt(context.Background(), now, Inf)
+				if err != nil {
+					t.Fatalf("allowAt(%s) error: %v", now.Format("15:04:05.000"), err)
+				}
+				if s.Limited || s.Delay <= 0 || s.Remaining > 0 {
+					t.Errorf("allowAt(%s) = %s, want (unlimited, 0 req, positive delay)", now.Format("15:04:05.000"), s)
+				}
+
+				// These events should be limited.
+				stopTime := now.Add(s.Delay)
+				now = now.Add(delta)
+				want = Status{Limited: true, Remaining: 0, Delay: s.Delay - delta}
+				for now.Before(stopTime) {
+					s, err := l.allowAt(context.Background(), now, Inf)
+					if err != nil {
+						t.Fatalf("allowAt(%s) error: %v", now.Format("15:04:05.000"), err)
+					}
+					if *s != want {
+						t.Errorf("allowAt(%s) = %s, want %s", now.Format("15:04:05.000"), s, want)
+					}
+					want.Delay -= delta
+					now = now.Add(delta)
+				}
+			})
+		}
 	})
 
-	t.Run("once per window", func(t *testing.T) {
+	t.Run("delta exceeds interval", func(t *testing.T) {
 		t.Parallel()
 
-		l := initLimiter(t, rds, fmt.Sprintf("%s:%s", key, t.Name()), Limit{5, 3 * time.Second})
+		lims := []Limit{
+			{Events: 1, Interval: 1 * time.Millisecond},
+			{Events: 2, Interval: 1 * time.Millisecond},
+			{Events: 1, Interval: 1 * time.Second},
+			{Events: 2, Interval: 1 * time.Second},
+		}
 
-		testAllow(t, l,
-			allow{now, Status{false, 4, 0 * time.Second}},
-			allow{now.Add(10 * time.Second), Status{false, 4, 0 * time.Second}},
-			allow{now.Add(20 * time.Second), Status{false, 4, 0 * time.Second}},
-		)
-	})
+		for _, lim := range lims {
+			t.Run(lim.String(), func(t *testing.T) {
+				t.Parallel()
 
-	t.Run("big window", func(t *testing.T) {
-		t.Parallel()
+				now := now
+				t.Logf("now: %s", now.Format("15:04:05.000"))
 
-		l := initLimiter(t, rds, fmt.Sprintf("%s:%s", key, t.Name()), Limit{1, 100 * time.Second})
+				l := initLimiter(t, rds, fmt.Sprintf("%s:%s", key, t.Name()), lim)
 
-		testAllow(t, l,
-			allow{now, Status{false, 0, 100 * time.Second}},
-			allow{now.Add(5 * time.Second), Status{true, 0, 95 * time.Second}},
-			allow{now.Add(50 * time.Second), Status{true, 0, 50 * time.Second}},
-			allow{now.Add(99 * time.Second), Status{true, 0, 1 * time.Second}},
-			allow{now.Add(100 * time.Second), Status{false, 0, 100 * time.Second}},
-			allow{now.Add(199 * time.Second), Status{true, 0, 1 * time.Second}},
-			allow{now.Add(201 * time.Second), Status{false, 0, 100 * time.Second}},
-		)
-	})
+				// First hit.
+				s1, err := l.allowAt(context.Background(), now, Inf)
+				if err != nil {
+					t.Fatalf("allowAt(%s) error: %v", now.Format("15:04:05.000"), err)
+				}
 
-	t.Run("window larger now", func(t *testing.T) {
-		t.Parallel()
-
-		limi := time.Duration(now.Add(1*time.Hour).UnixMilli()) * time.Millisecond // interval larger than now
-		l := initLimiter(t, rds, fmt.Sprintf("%s:%s", key, t.Name()), Limit{2, limi})
-
-		testAllow(t, l,
-			allow{now, Status{false, 1, 0}},
-			allow{now.Add(1 * time.Second), Status{false, 0, limi - 1*time.Second}},
-			allow{now.Add(10 * time.Second), Status{true, 0, limi - 10*time.Second}},
-		)
-	})
-
-	t.Run("sub-second", func(t *testing.T) {
-		t.Parallel()
-
-		l := initLimiter(t, rds, fmt.Sprintf("%s:%s", key, t.Name()), Limit{1, 2 * time.Millisecond})
-
-		testAllow(t, l,
-			allow{now, Status{false, 0, 2 * time.Millisecond}},
-			allow{now.Add(1 * time.Millisecond), Status{true, 0, 1 * time.Millisecond}},
-			allow{now.Add(2 * time.Millisecond), Status{false, 0, 2 * time.Millisecond}},
-		)
+				// Second hit. Limit should be reset.
+				now = now.Add(lim.Interval + 1*time.Millisecond)
+				s2, err := l.allowAt(context.Background(), now, Inf)
+				if err != nil {
+					t.Fatalf("allowAt(%s) error: %v", now.Format("15:04:05.000"), err)
+				}
+				if *s1 != *s2 {
+					t.Errorf("Limit not reset. allowAt(%s) = %s, want %s", now.Format("15:04:05.000"), s2, s1)
+				}
+			})
+		}
 	})
 }
 
@@ -194,96 +224,52 @@ func TestSetLimit(t *testing.T) {
 	rds := rediser{rds.NewClient(&rds.Options{Addr: redisAddr})}
 	key := "ratelimit:test_set_limit"
 
-	t.Run("incr events", func(t *testing.T) {
-		t.Parallel()
+	lim := Limit{Events: 1, Interval: 1 * time.Second}
+	l := initLimiter(t, rds, fmt.Sprintf("%s:%s", key, t.Name()), lim)
 
-		lim := Limit{1, 10 * time.Second}
+	if err := l.SetLimit(context.Background(), lim); err != nil {
+		t.Fatalf("SetLimit(%s) error: %v", lim, err)
+	}
+	if l.Limit() != lim {
+		t.Errorf("SetLimit(%s) failed to set limit; Limit() = %v, want %v", lim, l.Limit(), lim)
+	}
 
-		l := initLimiter(t, rds, fmt.Sprintf("%s:%s", key, t.Name()), lim)
-		testAllow(t, l,
-			allow{now, Status{false, 0, 10 * time.Second}},
-			allow{now.Add(1 * time.Second), Status{true, 0, 9 * time.Second}},
-		)
-
-		lim.Events = 5
-		if err := l.SetLimit(context.Background(), lim); err != nil {
-			t.Fatalf("SetLimit() unexpected error: %v", err)
-		}
-		testAllow(t, l,
-			allow{now.Add(2 * time.Second), Status{false, 3, 0 * time.Second}},
-			allow{now.Add(3 * time.Second), Status{false, 2, 0 * time.Second}},
-		)
-	})
-
-	t.Run("incr interval", func(t *testing.T) {
-		t.Parallel()
-
-		lim := Limit{1, 10 * time.Second}
-		l := initLimiter(t, rds, fmt.Sprintf("%s:%s", key, t.Name()), lim)
-		testAllow(t, l, allow{now, Status{false, 0, 10 * time.Second}})
-		testAllow(t, l, allow{now.Add(1 * time.Second), Status{true, 0, 9 * time.Second}})
-
-		lim.Interval = 20 * time.Second
-		if err := l.SetLimit(context.Background(), lim); err != nil {
-			t.Fatalf("SetLimit() unexpected error: %v", err)
-		}
-		testAllow(t, l, allow{now.Add(2 * time.Second), Status{true, 0, 18 * time.Second}})
-		testAllow(t, l, allow{now.Add(3 * time.Second), Status{true, 0, 17 * time.Second}})
-	})
-
-	t.Run("decr events", func(t *testing.T) {
-		t.Parallel()
-
-		lim := Limit{10, 10 * time.Second}
-
-		l := initLimiter(t, rds, fmt.Sprintf("%s:%s", key, t.Name()), lim)
-		testAllow(t, l, allow{now, Status{false, 9, 0 * time.Second}})
-		testAllow(t, l, allow{now.Add(1 * time.Second), Status{false, 8, 0 * time.Second}})
-		testAllow(t, l, allow{now.Add(2 * time.Second), Status{false, 7, 0 * time.Second}})
-		testAllow(t, l, allow{now.Add(3 * time.Second), Status{false, 6, 0 * time.Second}})
-		testAllow(t, l, allow{now.Add(4 * time.Second), Status{false, 5, 0 * time.Second}})
-
-		lim.Events = 2
-		if err := l.SetLimit(context.Background(), lim); err != nil {
-			t.Fatalf("SetLimit() unexpected error: %v", err)
-		}
-		testAllow(t, l, allow{now.Add(5 * time.Second), Status{true, 0, 8 * time.Second}})
-		testAllow(t, l, allow{now.Add(6 * time.Second), Status{true, 0, 7 * time.Second}})
-		testAllow(t, l, allow{now.Add(7 * time.Second), Status{true, 0, 6 * time.Second}})
-	})
-
-	t.Run("decr interval", func(t *testing.T) {
-		t.Parallel()
-
-		lim := Limit{4, 20 * time.Second}
-
-		l := initLimiter(t, rds, fmt.Sprintf("%s:%s", key, t.Name()), lim)
-		testAllow(t, l, allow{now, Status{false, 3, 0 * time.Second}})
-		testAllow(t, l, allow{now.Add(1 * time.Second), Status{false, 2, 0 * time.Second}})
-
-		lim.Interval = 10 * time.Second
-		if err := l.SetLimit(context.Background(), lim); err != nil {
-			t.Fatalf("SetLimit() unexpected error: %v", err)
-		}
-		testAllow(t, l, allow{now.Add(2 * time.Second), Status{false, 1, 0 * time.Second}})
-		testAllow(t, l, allow{now.Add(3 * time.Second), Status{false, 0, 7 * time.Second}})
-		testAllow(t, l, allow{now.Add(4 * time.Second), Status{true, 0, 6 * time.Second}})
-		testAllow(t, l, allow{now.Add(5 * time.Second), Status{true, 0, 5 * time.Second}})
-	})
+	lim = Limit{Events: 5, Interval: 10 * time.Second}
+	if err := l.SetLimit(context.Background(), lim); err != nil {
+		t.Fatalf("SetLimit(%s) error: %v", lim, err)
+	}
+	if l.Limit() != lim {
+		t.Errorf("SetLimit(%s) failed to set limit; Limit() = %v, want %v", lim, l.Limit(), lim)
+	}
 }
 
-func TestInvalidInterval(t *testing.T) {
-	tests := []Limit{
-		{1, -1},
-		{1, 0},
-		{1, 500 * time.Nanosecond},
-	}
+func TestInvalidLimit(t *testing.T) {
 
-	for _, tt := range tests {
-		if _, err := NewLimiter(nil, "", tt); !errors.Is(err, errInvalidInterval) {
-			t.Fatalf("NewSlidingLog() unexpected error: %v", err)
+	t.Run("invalid interval", func(t *testing.T) {
+		intervals := []time.Duration{-1, 0, 999 * time.Nanosecond}
+		for _, in := range intervals {
+			lim := Limit{Events: 1, Interval: in}
+			l, err := NewLimiter(nil, "", lim)
+			if !errors.Is(err, errInvalidInterval) {
+				t.Fatalf("NewLimiter(%s) error: %v, want: %v", lim, err, errInvalidInterval)
+			}
+			if err := l.SetLimit(context.Background(), lim); !errors.Is(err, errInvalidInterval) {
+				t.Fatalf("SetLimit(%s) error: %v, want: %v", lim, err, errInvalidInterval)
+			}
 		}
-	}
+	})
+
+	t.Run("invalid events", func(t *testing.T) {
+		lim := Limit{Events: -1, Interval: 1 * time.Second}
+		l, err := NewLimiter(nil, "", lim)
+
+		if !errors.Is(err, errInvalidEvents) {
+			t.Fatalf("NewLimiter(%s) error: %v, want: %v", lim, err, errInvalidEvents)
+		}
+		if err := l.SetLimit(context.Background(), lim); !errors.Is(err, errInvalidEvents) {
+			t.Fatalf("SetLimit(%s) error: %v, want: %v", lim, err, errInvalidEvents)
+		}
+	})
 }
 
 func TestReset(t *testing.T) {
@@ -292,22 +278,40 @@ func TestReset(t *testing.T) {
 	rds := rediser{rds.NewClient(&rds.Options{Addr: redisAddr})}
 	key := "ratelimit:test_reset"
 
-	l := initLimiter(t, rds, fmt.Sprintf("%s:%s", key, t.Name()), Limit{4, 20 * time.Second})
-	testAllow(t, l,
-		allow{now, Status{false, 3, 0 * time.Second}},
-		allow{now.Add(1 * time.Second), Status{false, 2, 0 * time.Second}},
-		allow{now.Add(2 * time.Second), Status{false, 1, 0 * time.Second}},
-		allow{now.Add(3 * time.Second), Status{false, 0, 17 * time.Second}},
-		allow{now.Add(4 * time.Second), Status{true, 0, 16 * time.Second}},
-	)
-	if err := l.Reset(context.Background()); err != nil {
-		t.Fatalf("Reset() returned an error: %v", err)
+	tests := []struct {
+		name   string
+		events int
+	}{
+		{"limited", 1},
+		{"unlimited", 2},
 	}
-	testAllow(t, l,
-		allow{now, Status{false, 3, 0 * time.Second}},
-		allow{now.Add(1 * time.Second), Status{false, 2, 0 * time.Second}},
-		allow{now.Add(2 * time.Second), Status{false, 1, 0 * time.Second}},
-		allow{now.Add(3 * time.Second), Status{false, 0, 17 * time.Second}},
-		allow{now.Add(4 * time.Second), Status{true, 0, 16 * time.Second}},
-	)
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			now := now
+			l := initLimiter(t, rds, fmt.Sprintf("%s:%s", key, t.Name()), Limit{Events: 1, Interval: 1 * time.Second})
+
+			// First event.
+			s1, err := l.allowAt(context.Background(), now, Inf)
+			if err != nil {
+				t.Fatalf("allowAt(%s) error: %v", now.Format("15:04:05.000"), err)
+			}
+
+			now = now.Add(delta)
+
+			// After Reset() second event should return the same status as the first event.
+			if err := l.Reset(context.Background()); err != nil {
+				t.Fatalf("Reset() error: %v", err)
+			}
+			s2, err := l.allowAt(context.Background(), now, Inf)
+			if err != nil {
+				t.Fatalf("allowAt(%s) error: %v", now.Format("15:04:05.000"), err)
+			}
+			if *s1 != *s2 {
+				t.Errorf("Limit not reset. allowAt(%s) = %s, want %s", now.Format("15:04:05.000"), s2, s1)
+			}
+		})
+	}
 }

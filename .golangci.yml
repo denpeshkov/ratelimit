@@ -24,7 +24,6 @@ linters:
     - unused
 
     # Our own extras:
-    - bodyclose
     - exhaustive
     - goimports
     - gosec
